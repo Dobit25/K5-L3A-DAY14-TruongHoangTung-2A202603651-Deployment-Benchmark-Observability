@@ -1,21 +1,51 @@
-"""
-Cost guard (tiêu chí 8).
+from datetime import datetime, timezone
 
-Yêu cầu:
-  • Cộng dồn chi phí LLM (tính theo token) vào Redis
-  • Tổng chi phí vượt DAILY_BUDGET_USD (hoặc MONTHLY_BUDGET_USD) → HTTP 402
-"""
+from fastapi import HTTPException
 
-# Giá USD / 1K tokens (tham khảo gpt-4o-mini)
-PRICE_INPUT_PER_1K = 0.00015
-PRICE_OUTPUT_PER_1K = 0.0006
+from utils.mock_llm import MOCK_RESPONSES
 
+from .config import settings
+from .redis_client import r
 
-def check_budget() -> None:
-    """Gọi TRƯỚC khi gọi LLM. Hết budget → raise HTTPException(status_code=402)."""
-    raise NotImplementedError("TODO: check_budget")
+# Integer nano-USD per token (the mock estimates one token per four characters).
+INPUT_PRICE = 150
+OUTPUT_PRICE = 600
+NANO_USD = 10**9
 
 
-def record_cost(input_tokens: int, output_tokens: int) -> float:
-    """Gọi SAU khi gọi LLM. Cộng chi phí của request vào tổng, trả về chi phí request."""
-    raise NotImplementedError("TODO: record_cost")
+def tokens(text: str) -> int:
+    return max(1, (len(text) + 3) // 4)
+
+
+MAX_OUTPUT = max(tokens(text) for choices in MOCK_RESPONSES.values() for text in choices)
+reserve = r.register_script("""
+local amount = tonumber(ARGV[1])
+for i = 1, 2 do
+    if tonumber(redis.call('GET', KEYS[i]) or 0) + amount > tonumber(ARGV[i+1]) then
+        return 0
+    end
+end
+for i = 1, 2 do
+    redis.call('INCRBY', KEYS[i], amount)
+    redis.call('EXPIRE', KEYS[i], tonumber(ARGV[i+3]))
+end
+return 1
+""")
+
+
+def check_budget(question: str) -> tuple[list[str], int]:
+    now = datetime.now(timezone.utc)
+    keys = [f"day14:cost:{now:%Y-%m-%d}", f"day14:cost:{now:%Y-%m}"]
+    maximum = tokens(question) * INPUT_PRICE + MAX_OUTPUT * OUTPUT_PRICE
+    limits = [int(settings.daily_budget_usd * NANO_USD), int(settings.monthly_budget_usd * NANO_USD)]
+    if not reserve(keys=keys, args=[maximum, *limits, 2 * 86400, 32 * 86400]):
+        raise HTTPException(402, "LLM budget exhausted")
+    return keys, maximum
+
+
+def record_cost(reservation: tuple[list[str], int], actual: int) -> None:
+    keys, maximum = reservation
+    with r.pipeline(transaction=True) as transaction:
+        for key in keys:
+            transaction.incrby(key, actual - maximum)
+        transaction.execute()
